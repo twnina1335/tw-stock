@@ -1,3 +1,5 @@
+import time
+from datetime import datetime, timedelta
 import pandas as pd
 import requests
 import streamlit as st
@@ -5,21 +7,18 @@ import yfinance as yf
 
 # 頁面標題與設定
 st.set_page_config(
-    page_title="台股個股買點訊號診斷器", page_icon="🎯", layout="wide"
+    page_title="台股動態估值評分系統", page_icon="📈", layout="wide"
 )
 
-st.title("🎯 台股個股買點訊號綜合診斷器")
+st.title("📈 台股動態估值評分系統")
 st.caption(
-    "輸入單檔股票代碼，結合技術面 (站穩季線/多頭排列)、籌碼量能與基本面 (PEG/PE) 自動判定是否為合適買點。"
+    "估值分數區間 0~100 分：分數越高代表股價相對估值越便宜、安全邊際越高。"
 )
 
 
-# ==========================================
-# 輔助函式區
-# ==========================================
-@st.cache_data(ttl=86400)  # 快取時間延長至 24 小時，避免頻繁請求證交所 API
+@st.cache_data(ttl=3600)
 def get_twse_stock_names():
-    """取得上市股票名稱字典 (快取 24 小時)"""
+    """取得上市股票與 ETF 名稱字典 (快取 1 小時)"""
     url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     try:
         res = requests.get(url, timeout=10)
@@ -29,183 +28,360 @@ def get_twse_stock_names():
         return {}
 
 
-def analyze_buy_signal(stock_code: str):
-    """綜合技術面、基本面、量能評估買點訊號與分數"""
-    # 判斷是否帶有字尾，若無預設加上 .TW
-    symbol = (
-        stock_code
-        if stock_code.endswith(".TW") or stock_code.endswith(".TWO")
-        else f"{stock_code}.TW"
-    )
-    ticker = yf.Ticker(symbol)
-
-    # 抓取近 1 年歷史股價數據
-    df = ticker.history(period="1y")
-
-    if df.empty:
-        return None, "❌ 無法取得股價數據，請確認代碼是否正確。", [], {}
-
-    # 計算技術指標
-    df["MA20"] = df["Close"].rolling(window=20).mean()
-    df["MA60"] = df["Close"].rolling(window=60).mean()  # 60日季線
-    df["Volume_MA20"] = df["Volume"].rolling(window=20).mean()
-
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    latest_price = latest["Close"]
-    ma20 = latest["MA20"]
-    ma60 = latest["MA60"]
-    ma60_prev = prev["MA60"]
-
-    # 基本面數據
-    info = ticker.info
-    pe_ratio = info.get("trailingPE", None) or info.get("forwardPE", None)
-    earnings_growth = info.get("earningsGrowth", None)
-
-    score = 0
-    details = []
-
-    # --- 1. 技術面評分 (滿分 45) ---
-    if latest_price > ma60:
-        score += 20
-        details.append("✅ 股價高於 60 日季線 (站穩季線，+20分)")
-    else:
-        details.append("❌ 股價低於 60 日季線 (+0分)")
-
-    if ma60 > ma60_prev:
-        score += 15
-        details.append("✅ 60 日季線斜率向上 (長線趨勢向上，+15分)")
-    else:
-        details.append("❌ 60 日季線斜率向下 (+0分)")
-
-    if ma20 > ma60:
-        score += 10
-        details.append("✅ 月線高於季線 (均線多頭排列，+10分)")
-    else:
-        details.append("⚠️ 月線低於季線 (屬盤整震盪期，+0分)")
-
-    # --- 2. 量能與動能面評分 (滿分 25) ---
-    if latest["Volume"] > latest["Volume_MA20"] * 1.3:
-        score += 15
-        details.append(
-            "✅ 今日成交量顯著放大 (大於20日均量1.3倍，有攻擊動能，+15分)"
-        )
-    elif latest["Volume"] < latest["Volume_MA20"] * 0.7:
-        score += 10
-        details.append("✅ 橫盤縮量沉澱 (利於籌碼鎖定，+10分)")
-    else:
-        score += 5
-        details.append("ℹ️ 成交量維持正常水準 (+5分)")
-
-    five_day_return = (latest_price - df.iloc[-6]["Close"]) / df.iloc[-6][
-        "Close"
-    ]
-    if 0.01 <= five_day_return <= 0.08:
-        score += 10
-        details.append("✅ 近 5 日溫和上漲 (處於漲勢發動初期，+10分)")
-    elif five_day_return > 0.08:
-        score += 5
-        details.append("⚠️ 近 5 日漲幅較大 (宜注意短線過熱追高風險，+5分)")
-    else:
-        details.append("ℹ️ 近 5 日呈拉回或橫盤整理 (+0分)")
-
-    # --- 3. 估值與 PEG 評分 (滿分 30) ---
-    peg = None
-    if pe_ratio and earnings_growth and earnings_growth > 0:
-        peg = pe_ratio / (earnings_growth * 100)
-
-    if peg is not None:
-        if peg <= 1.0:
-            score += 30
-            details.append(
-                f"✅ PEG 為 {peg:.2f} (<= 1.0，相對於成長性極具安全邊際，+30分)"
-            )
-        elif 1.0 < peg <= 1.5:
-            score += 20
-            details.append(
-                f"✅ PEG 為 {peg:.2f} (1.0~1.5，屬市場正常合理區間，+20分)"
-            )
-        else:
-            score += 5
-            details.append(
-                f"⚠️ PEG 為 {peg:.2f} (> 1.5，目前價格偏貴或成長動能稍緩，+5分)"
-            )
-    else:
-        if pe_ratio and pe_ratio < 25:
-            score += 20
-            details.append(
-                f"ℹ️ (備用估值) 本益比為 {pe_ratio:.1f} (屬於合理區間，+20分)"
-            )
-        else:
-            score += 10
-            details.append("ℹ️ 基本面數據不足或本益比偏高 (+10分)")
-
-    # 結論判定
-    if score >= 75 and latest_price > ma60:
-        conclusion = "🚀【強烈買點訊號】：符合多頭架構！(站穩季線、估值合理且動能充足)"
-    elif score >= 60:
-        conclusion = (
-            "⏳【觀望/逢低布局】：接近買點條件，可關注拉回季線支撐時機。"
-        )
-    else:
-        conclusion = (
-            "❌【暫非買點】：尚未滿足條件 (股價偏弱、跌破季線或價格偏貴)。"
-        )
-
-    summary_info = {
-        "latest_price": round(latest_price, 2),
-        "ma60": round(ma60, 2),
-        "pe": round(pe_ratio, 2) if pe_ratio else "N/A",
-        "peg": round(peg, 2) if peg else "N/A",
+@st.cache_data(ttl=3600)
+def get_top10_tw_tickers():
+    """抓取市值前 10 大個股 (快取 1 小時)"""
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALL"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
-    return score, conclusion, details, summary_info
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        data = response.json()
+
+        rows, fields = [], []
+        for table in data.get("tables", []):
+            if "每日收盤行情" in table.get("title", "") or "Stock No." in str(
+                table
+            ):
+                fields = table["fields"]
+                rows = table["data"]
+                break
+
+        df_raw = pd.DataFrame(rows, columns=fields)
+        df_raw["SecurityCode"] = df_raw["證券代號"].str.strip()
+        df_raw = df_raw[df_raw["SecurityCode"].str.match(r"^\d{4}$")]
+
+        df_raw["ClosePrice"] = pd.to_numeric(
+            df_raw["收盤價"].str.replace(",", ""), errors="coerce"
+        )
+        df_raw["Shares"] = pd.to_numeric(
+            df_raw["發行股數"].str.replace(",", ""), errors="coerce"
+        )
+        df_raw["MarketCap"] = df_raw["ClosePrice"] * df_raw["Shares"]
+
+        top10_df = df_raw.sort_values(by="MarketCap", ascending=False).head(10)
+        ticker_name_map = dict(
+            zip(
+                top10_df["SecurityCode"], top10_df["證券名稱"].str.strip()
+            )
+        )
+        return list(ticker_name_map.keys()), ticker_name_map
+
+    except Exception:
+        fallback_map = {
+            "2330": "台積電",
+            "2317": "鴻海",
+            "2308": "台達電",
+            "2454": "聯發科",
+            "3711": "日月光投控",
+            "2881": "富邦金",
+            "2382": "廣達",
+            "2882": "國泰金",
+            "2412": "中華電",
+            "2891": "中信金",
+        }
+        return list(fallback_map.keys()), fallback_map
 
 
-# ==========================================
-# 主介面：個股買點訊號綜合診斷器
-# ==========================================
-stock_to_analyze = st.text_input(
-    "請輸入要進行買點評估的股票代碼",
-    placeholder="例如: 2330 或 2454",
-    key="analyze_input",
-)
+def calculate_valuation_score(price, eps, pb_ratio, is_financial, is_etf=False):
+    """計算估值分數 (0 ~ 100 分，越便宜分數越高)"""
+    if not price or price <= 0:
+        return None
 
-if stock_to_analyze:
-    stock_code_clean = stock_to_analyze.strip()
-    with st.spinner(f"正在對 {stock_code_clean} 進行買點綜合指標分析..."):
-        all_names = get_twse_stock_names()
-        stock_name = all_names.get(stock_code_clean, stock_code_clean)
+    if is_etf:
+        # ETF 以淨值偏離度/折溢價評估
+        if pb_ratio:
+            premium_discount = (pb_ratio - 1.0) * 100
+            score = 50 - (premium_discount * 10)
+            return max(0, min(100, round(score, 1)))
+        return 50.0
 
-        res = analyze_buy_signal(stock_code_clean)
+    if is_financial:
+        # 金融股看 PB：PB <= 1.0 (100分)，PB >= 1.8 (0分)
+        if not pb_ratio or pb_ratio <= 0:
+            return None
+        min_pb, max_pb = 1.0, 1.8
+        score = (max_pb - pb_ratio) / (max_pb - min_pb) * 100
+    else:
+        # 一般股看 PE：PE <= 12 (100分)，PE >= 25 (0分)
+        if not eps or eps <= 0:
+            return None
+        pe = price / eps
+        min_pe, max_pe = 12.0, 25.0
+        score = (max_pe - pe) / (max_pe - min_pe) * 100
 
-        if res[0] is not None:
-            score, conclusion, details, summary_info = res
+    return max(0, min(100, round(score, 1)))
 
-            # 顯示綜合評估結果卡片
-            st.markdown(f"### 📊 分析股票：{stock_code_clean} {stock_name}")
 
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("綜合評分", f"{score} / 100 分")
-            col2.metric("最新收盤價", f"{summary_info['latest_price']} 元")
-            col3.metric("60日季線 (MA60)", f"{summary_info['ma60']} 元")
-            col4.metric(
-                "PEG / PE",
-                f"{summary_info['peg']} / {summary_info['pe']}",
+def get_status_text(score):
+    """依照分數給予評價標籤"""
+    if score is None:
+        return "⚪ 資料不足"
+    if score >= 70:
+        return f"🟢 便宜 ({score}分)"
+    elif score >= 40:
+        return f"🟡 合理 ({score}分)"
+    else:
+        return f"🔴 偏貴 ({score}分)"
+
+
+def fetch_valuation_with_weekly_scores(stock_codes, name_map, delay=0.0):
+    """批次取得個股最新指標與近一週分數，支援間隔防封鎖"""
+    summary_results = []
+    weekly_history = {}
+
+    for code in stock_codes:
+        symbol = f"{code}.TW"
+        chinese_name = name_map.get(code, code)
+        is_financial = code.startswith("28")
+        is_etf = code.startswith("00")
+
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+
+            hist = ticker.history(period="15d")
+            hist_closes = (
+                hist["Close"].dropna().tail(5) if not hist.empty else None
             )
 
-            # 顯示結論訊息框
-            if score >= 75:
-                st.success(f"### {conclusion}")
-            elif score >= 60:
-                st.warning(f"### {conclusion}")
-            else:
-                st.error(f"### {conclusion}")
+            current_price = info.get("currentPrice") or info.get(
+                "regularMarketPrice"
+            )
+            pe_ratio = info.get("trailingPE")
+            pb_ratio = info.get("priceToBook")
+            eps = info.get("trailingEps")
 
-            # 顯示評分明細
-            with st.expander("🔍 點擊查看詳細評分項目細節", expanded=True):
-                for detail in details:
-                    st.write(f"- {detail}")
-        else:
-            st.error(f"無法分析股票代碼：{stock_code_clean}")
+            today_score = calculate_valuation_score(
+                current_price, eps, pb_ratio, is_financial, is_etf
+            )
+
+            summary_results.append(
+                {
+                    "股票代碼": code,
+                    "公司簡稱": chinese_name,
+                    "最新收盤價": current_price if current_price else "N/A",
+                    "本益比 (PE)": (
+                        round(pe_ratio, 2)
+                        if pe_ratio
+                        else ("ETF無" if is_etf else "N/A")
+                    ),
+                    "股價淨值比 (PB)": (
+                        round(pb_ratio, 2) if pb_ratio else "N/A"
+                    ),
+                    "今日估值評分": (
+                        today_score if today_score is not None else -1
+                    ),
+                    "評估狀態": get_status_text(today_score),
+                }
+            )
+
+            if hist_closes is not None and not hist_closes.empty:
+                book_value = (
+                    (current_price / pb_ratio)
+                    if (pb_ratio and current_price)
+                    else None
+                )
+                daily_scores = {}
+                for date, close_p in hist_closes.items():
+                    date_str = date.strftime("%m/%d")
+                    day_pb = (close_p / book_value) if book_value else None
+                    score = calculate_valuation_score(
+                        close_p, eps, day_pb, is_financial, is_etf
+                    )
+                    daily_scores[date_str] = score
+                weekly_history[f"{code} {chinese_name}"] = daily_scores
+
+        except Exception:
+            continue
+
+        if delay > 0:
+            time.sleep(delay)
+
+    df_summary = pd.DataFrame(summary_results)
+    df_weekly = (
+        pd.DataFrame(weekly_history).T if weekly_history else pd.DataFrame()
+    )
+    return df_summary, df_weekly
+
+
+# ==================== 頁面佈局 ====================
+
+# ---------------- PART 1: Top 10 權值股 ----------------
+st.subheader("🔥 今日上市前 10 大權值股估值評分")
+
+with st.spinner("正在連線證交所與計算前 10 大數據..."):
+    top10_codes, top10_name_map = get_top10_tw_tickers()
+    df_top10, df_top10_weekly = fetch_valuation_with_weekly_scores(
+        top10_codes, top10_name_map
+    )
+
+    if not df_top10.empty:
+        df_top10_display = df_top10.copy()
+        df_top10_display["今日估值評分"] = df_top10_display[
+            "今日估值評分"
+        ].apply(lambda x: x if x >= 0 else "N/A")
+        st.dataframe(df_top10_display, use_container_width=True, hide_index=True)
+
+        with st.expander("📅 查看前 10 大權值股「近一週分數走勢」", expanded=False):
+            st.dataframe(df_top10_weekly, use_container_width=True)
+
+st.divider()
+
+# ---------------- PART 2: 自訂個股查詢 ----------------
+st.subheader("🔍 自訂個股估值查詢")
+user_input = st.text_input(
+    "請輸入股票代碼 (多檔請用逗號隔開)",
+    placeholder="例如: 2603, 3037, 2303",
+)
+
+if user_input:
+    raw_codes = [
+        code.strip() for code in user_input.replace("，", ",").split(",")
+    ]
+    custom_codes = [c for c in raw_codes if c]
+
+    if custom_codes:
+        with st.spinner("正在計算自訂個股估值..."):
+            all_names = get_twse_stock_names()
+            custom_name_map = {c: all_names.get(c, c) for c in custom_codes}
+            df_custom, df_custom_weekly = fetch_valuation_with_weekly_scores(
+                custom_codes, custom_name_map
+            )
+
+            df_custom_display = df_custom.copy()
+            df_custom_display["今日估值評分"] = df_custom_display[
+                "今日估值評分"
+            ].apply(lambda x: x if x >= 0 else "N/A")
+            st.dataframe(
+                df_custom_display, use_container_width=True, hide_index=True
+            )
+
+            with st.expander("📅 查看自訂個股「近一週分數走勢」", expanded=True):
+                st.dataframe(df_custom_weekly, use_container_width=True)
+
+st.divider()
+
+# ---------------- PART 3: 精選股票慢速安全試算 (擴充至 21 檔) ----------------
+st.subheader("⭐ 精選觀察清單 (手動安全試算)")
+
+# 擴充後的 21 檔觀察名單
+preset_stocks = [
+    "2330",
+    "0050",
+    "0056",
+    "2317",
+    "2301",
+    "2308",
+    "3008",
+    "00896",
+    "2395",
+    "2885",
+    "2890",
+    "00878",
+    "3231",
+    "00850",
+    "2454",
+    "2379",
+    "2327",
+    "2880",
+    "2884",
+    "2881",
+    "2882",
+]
+
+# 備援中文名稱字典
+preset_names = {
+    "2330": "台積電",
+    "0050": "元大台灣50",
+    "0056": "元大高股息",
+    "2317": "鴻海",
+    "2301": "光寶科",
+    "2308": "台達電",
+    "3008": "大立光",
+    "00896": "中信綠能及電動車",
+    "2395": "研華",
+    "2885": "元大金",
+    "2890": "永豐金",
+    "00878": "國泰永續高股息",
+    "3231": "緯創",
+    "00850": "元大臺灣ESG永續",
+    "2454": "聯發科",
+    "2379": "瑞昱",
+    "2327": "國巨",
+    "2880": "華南金",
+    "2884": "玉山金",
+    "2881": "富邦金",
+    "2882": "國泰金",
+}
+
+st.caption(
+    "觀察清單包含 21 檔標的：" + "、".join([f"{c} ({preset_names[c]})" for c in preset_stocks])
+)
+
+if st.button("🚀 開始計算精選股票分數 (防封鎖慢速模式)", type="primary"):
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    all_names = get_twse_stock_names()
+    for c in preset_stocks:
+        if c not in all_names:
+            all_names[c] = preset_names.get(c, c)
+
+    results_list = []
+    weekly_dict = {}
+
+    for idx, code in enumerate(preset_stocks):
+        status_text.text(
+            f"正在抓取並計算 ({idx + 1}/{len(preset_stocks)}): {code} {all_names.get(code, '')}..."
+        )
+
+        # 慢速模式：每檔抓取後間隔 0.8 秒防封鎖
+        sub_df, sub_weekly = fetch_valuation_with_weekly_scores(
+            [code], all_names, delay=0.8
+        )
+
+        if not sub_df.empty:
+            results_list.append(sub_df)
+        if not sub_weekly.empty:
+            weekly_dict.update(sub_weekly.to_dict(orient="index"))
+
+        progress_bar.progress((idx + 1) / len(preset_stocks))
+
+    status_text.text("✅ 所有精選股票試算完成！")
+    time.sleep(0.5)
+
+    if results_list:
+        df_preset = pd.concat(results_list, ignore_index=True)
+
+        # 依照分數由高至低排列 (高分 = 便宜 / 安全邊際高)
+        df_preset = df_preset.sort_values(
+            by="今日估值評分", ascending=False
+        ).reset_index(drop=True)
+
+        df_preset_display = df_preset.copy()
+        df_preset_display["今日估值評分"] = df_preset_display[
+            "今日估值評分"
+        ].apply(lambda x: x if x >= 0 else "N/A")
+
+        st.success("試算結果（已依分數由高至低排列，越上方越便宜／安全邊際越高）：")
+        st.dataframe(
+            df_preset_display, use_container_width=True, hide_index=True
+        )
+
+        # 近一週分數走勢
+        if weekly_dict:
+            df_preset_weekly = pd.DataFrame.from_dict(
+                weekly_dict, orient="index"
+            )
+            ordered_keys = [
+                f"{row['股票代碼']} {row['公司簡稱']}"
+                for _, row in df_preset.iterrows()
+                if f"{row['股票代碼']} {row['公司簡稱']}" in df_preset_weekly.index
+            ]
+            df_preset_weekly = df_preset_weekly.reindex(ordered_keys)
+
+            with st.expander("📅 查看精選清單「近一週分數走勢」", expanded=True):
+                st.dataframe(df_preset_weekly, use_container_width=True)
