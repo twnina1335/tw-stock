@@ -66,22 +66,18 @@ def resolve_stock_code(query: str, name_dict: dict):
     if not clean_q:
         return None, None
 
-    # 1. 若輸入的是數字代碼 (如 2330, 0050, 或 2330.TW)
     code_candidate = clean_q.upper().replace(".TW", "").replace(".TWO", "")
     if code_candidate in name_dict:
         return code_candidate, name_dict[code_candidate]
 
-    # 2. 精確匹配中文名稱 (如 "台積電" -> "2330")
     for code, name in name_dict.items():
         if clean_q == name:
             return code, name
 
-    # 3. 模糊匹配中文名稱 (如輸入 "台積"、"聯發"、"高股息")
     for code, name in name_dict.items():
         if clean_q in name:
             return code, name
 
-    # 4. 若皆無匹配，且純數字則直接當作代碼嘗試
     if code_candidate.isdigit():
         return code_candidate, code_candidate
 
@@ -143,4 +139,33 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     else:
         details.append("❌ 60 日季線斜率向下 (+0分)")
 
-    if curr_ma20 > curr_ma6
+    # 💡 修正此處
+    if curr_ma20 > curr_ma60:
+        score += 10
+        details.append("✅ 月線高於季線 (均線多頭排列，+10分)")
+    else:
+        details.append("⚠️ 月線低於季線 (屬盤整震盪期，+0分)")
+
+    # 2. 量能與動能 (滿分 25)
+    if curr["Volume"] > curr["Volume_MA20"] * 1.3:
+        score += 15
+        details.append("✅ 成交量顯著放大 (攻擊動能，+15分)")
+    elif curr["Volume"] < curr["Volume_MA20"] * 0.7:
+        score += 10
+        details.append("✅ 橫盤縮量沉澱 (籌碼鎖定，+10分)")
+    else:
+        score += 5
+        details.append("ℹ️ 成交量維持正常水準 (+5分)")
+
+    base_price = df.iloc[idx - 5]["Close"]
+    return_5d = (curr_price - base_price) / base_price
+    if 0.01 <= return_5d <= 0.08:
+        score += 10
+        details.append("✅ 近 5 日溫和上漲 (+10分)")
+    elif return_5d > 0.08:
+        score += 5
+        details.append("⚠️ 近 5 日漲幅較大 (防短線追高，+5分)")
+    else:
+        details.append("ℹ️ 近 5 日呈拉回或橫盤整理 (+0分)")
+
+    #
