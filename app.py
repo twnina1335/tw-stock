@@ -15,35 +15,77 @@ st.caption(
     "結合技術面 (站穩季線/多頭排列)、籌碼量能與基本面 (PEG/PE) 自動判定是否為合適買點。"
 )
 
+# 初始化 Session State，保留 21 檔批次試算結果
+if "batch_results" not in st.session_state:
+    st.session_state.batch_results = None
+
 
 # ==========================================
 # 輔助函式區
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_twse_stock_names():
-    """取得上市股票名稱字典 (快取 24 小時)"""
+    """取得上市股票名稱字典與反向名稱索引 (快取 24 小時)"""
     url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     try:
         res = requests.get(url, timeout=10)
         data = res.json()
         name_dict = {item["Code"].strip(): item["Name"].strip() for item in data}
+        
+        # 補充常見熱門 ETF 名稱
         etf_map = {
             "0050": "元大台灣50",
             "0056": "元大高股息",
             "00878": "國泰永續高股息",
             "00850": "元大臺灣ESG永續",
             "00896": "中信綠能及電動車",
+            "00929": "復華台灣科技優息",
+            "00919": "群益台灣精選高息",
+            "00940": "元大臺灣價值高息",
         }
         name_dict.update(etf_map)
         return name_dict
     except Exception:
         return {
+            "2330": "台積電",
+            "2317": "鴻海",
+            "2454": "聯發科",
             "0050": "元大台灣50",
             "0056": "元大高股息",
             "00878": "國泰永續高股息",
             "00850": "元大臺灣ESG永續",
             "00896": "中信綠能及電動車",
         }
+
+
+def resolve_stock_code(query: str, name_dict: dict):
+    """
+    解析使用者輸入：無論輸入代碼或中文名稱，統一解析出標準股票代碼與名稱
+    """
+    clean_q = query.strip()
+    if not clean_q:
+        return None, None
+
+    # 1. 若輸入的是數字代碼 (如 2330, 0050, 或 2330.TW)
+    code_candidate = clean_q.upper().replace(".TW", "").replace(".TWO", "")
+    if code_candidate in name_dict:
+        return code_candidate, name_dict[code_candidate]
+
+    # 2. 精確匹配中文名稱 (如 "台積電" -> "2330")
+    for code, name in name_dict.items():
+        if clean_q == name:
+            return code, name
+
+    # 3. 模糊匹配中文名稱 (如輸入 "台積"、"聯發"、"高股息")
+    for code, name in name_dict.items():
+        if clean_q in name:
+            return code, name
+
+    # 4. 若皆無匹配，且純數字則直接當作代碼嘗試
+    if code_candidate.isdigit():
+        return code_candidate, code_candidate
+
+    return None, None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -59,11 +101,8 @@ def get_yfinance_ticker_data(symbol: str):
     )
 
     ticker = yf.Ticker(symbol, session=session)
-    
-    # 歷史股價資料通常不會被 401
     df = ticker.history(period="1y")
 
-    # info (基本面) 容易被 401 擋住，以獨立 try-except 保護
     info = {}
     try:
         info = ticker.info
@@ -104,246 +143,4 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     else:
         details.append("❌ 60 日季線斜率向下 (+0分)")
 
-    if curr_ma20 > curr_ma60:
-        score += 10
-        details.append("✅ 月線高於季線 (均線多頭排列，+10分)")
-    else:
-        details.append("⚠️ 月線低於季線 (屬盤整震盪期，+0分)")
-
-    # 2. 量能與動能 (滿分 25)
-    if curr["Volume"] > curr["Volume_MA20"] * 1.3:
-        score += 15
-        details.append("✅ 成交量顯著放大 (攻擊動能，+15分)")
-    elif curr["Volume"] < curr["Volume_MA20"] * 0.7:
-        score += 10
-        details.append("✅ 橫盤縮量沉澱 (籌碼鎖定，+10分)")
-    else:
-        score += 5
-        details.append("ℹ️ 成交量維持正常水準 (+5分)")
-
-    base_price = df.iloc[idx - 5]["Close"]
-    return_5d = (curr_price - base_price) / base_price
-    if 0.01 <= return_5d <= 0.08:
-        score += 10
-        details.append("✅ 近 5 日溫和上漲 (+10分)")
-    elif return_5d > 0.08:
-        score += 5
-        details.append("⚠️ 近 5 日漲幅較大 (防短線追高，+5分)")
-    else:
-        details.append("ℹ️ 近 5 日呈拉回或橫盤整理 (+0分)")
-
-    # 3. 估值與 PEG (滿分 30)
-    peg = None
-    if pe_ratio and earnings_growth and earnings_growth > 0:
-        try:
-            peg = pe_ratio / (earnings_growth * 100)
-        except Exception:
-            peg = None
-
-    is_etf = stock_code.startswith("00")
-    if is_etf:
-        score += 20
-        details.append("ℹ️ ETF 標的，給予指數估值基準分 (+20分)")
-    elif peg is not None:
-        if peg <= 1.0:
-            score += 30
-            details.append(f"✅ PEG 為 {peg:.2f} (<= 1.0，安全邊際高，+30分)")
-        elif 1.0 < peg <= 1.5:
-            score += 20
-            details.append(f"✅ PEG 為 {peg:.2f} (1.0~1.5，屬合理區間，+20分)")
-        else:
-            score += 5
-            details.append(f"⚠️ PEG 為 {peg:.2f} (> 1.5，價格偏貴，+5分)")
-    elif pe_ratio is not None:
-        if pe_ratio < 25:
-            score += 20
-            details.append(f"ℹ️ 本益比為 {pe_ratio:.1f} (合理區間，+20分)")
-        else:
-            score += 10
-            details.append("ℹ️ 基本面本益比偏高 (+10分)")
-    else:
-        # 當 Yahoo Finance API 擋下 info 時的保底處理
-        score += 15
-        details.append("ℹ️ 估值資料暫時受限，以標準中間基準分評定 (+15分)")
-
-    return score, details, round(curr_price, 2), round(curr_ma60, 2), peg, pe_ratio
-
-
-def analyze_buy_signal(stock_code: str, calc_5days_history: bool = False):
-    """綜合評估買點訊號，可選擇計算近 5 日每日評分變化"""
-    symbol = (
-        stock_code
-        if stock_code.endswith(".TW") or stock_code.endswith(".TWO")
-        else f"{stock_code}.TW"
-    )
-
-    try:
-        df, info = get_yfinance_ticker_data(symbol)
-
-        if df is None or len(df) < 70:
-            return None, "❌ 歷史資料不足或代碼有誤 (至少需 70 天資料)", [], {}, None
-
-        df["MA20"] = df["Close"].rolling(window=20).mean()
-        df["MA60"] = df["Close"].rolling(window=60).mean()
-        df["Volume_MA20"] = df["Volume"].rolling(window=20).mean()
-
-        score, details, latest_price, ma60, peg, pe = compute_score_at_index(
-            df, -1, info, stock_code
-        )
-
-        if score >= 75 and latest_price > ma60:
-            conclusion = "🚀 強烈買點訊號 (站穩季線、估值合理、動能充沛)"
-        elif score >= 60:
-            conclusion = "⏳ 觀望 / 逢低布局 (接近買點，建議注意回測支撐)"
-        else:
-            conclusion = "❌ 暫非買點 (弱勢整理、跌破季線或估值偏貴)"
-
-        summary_info = {
-            "latest_price": latest_price,
-            "ma60": ma60,
-            "pe": round(pe, 2) if pe else "N/A",
-            "peg": round(peg, 2) if peg else "N/A",
-        }
-
-        history_df = None
-        if calc_5days_history:
-            records = []
-            for i in range(-5, 0):
-                d_score, _, d_price, d_ma60, _, _ = compute_score_at_index(
-                    df, i, info, stock_code
-                )
-                date_str = df.index[i].strftime("%m/%d")
-                records.append({
-                    "日期": date_str,
-                    "收盤價": d_price,
-                    "60日季線": d_ma60,
-                    "評分": d_score
-                })
-            history_df = pd.DataFrame(records)
-
-        return score, conclusion, details, summary_info, history_df
-
-    except Exception as e:
-        return None, str(e), [], {}, None
-
-
-# ==========================================
-# 第一區塊：單檔個股買點訊號診斷器 (含近 5 日分數計算)
-# ==========================================
-st.subheader("🔍 單檔股票即時診斷")
-stock_to_analyze = st.text_input(
-    "請輸入要診斷的股票代碼",
-    placeholder="例如: 2330 或 2454",
-    key="analyze_input",
-)
-
-if stock_to_analyze:
-    stock_code_clean = stock_to_analyze.strip()
-    with st.spinner(f"正在分析 {stock_code_clean} 及其近 5 日評分趨勢..."):
-        all_names = get_twse_stock_names()
-        stock_name = all_names.get(stock_code_clean, stock_code_clean)
-        res = analyze_buy_signal(stock_code_clean, calc_5days_history=True)
-
-        if res[0] is not None:
-            score, conclusion, details, summary_info, history_df = res
-            st.markdown(f"### 📊 分析股票：{stock_code_clean} {stock_name}")
-
-            delta_score_str = None
-            if history_df is not None and len(history_df) >= 5:
-                score_5d_ago = history_df.iloc[0]["評分"]
-                diff = score - score_5d_ago
-                delta_score_str = f"{'+' if diff > 0 else ''}{diff} 分 (較5日前)"
-
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("今日綜合評分", f"{score} 分", delta=delta_score_str)
-            col2.metric("最新收盤價", f"{summary_info['latest_price']} 元")
-            col3.metric("60日季線 (MA60)", f"{summary_info['ma60']} 元")
-            col4.metric("PEG / PE", f"{summary_info['peg']} / {summary_info['pe']}")
-
-            if score >= 75:
-                st.success(f"### {conclusion}")
-            elif score >= 60:
-                st.warning(f"### {conclusion}")
-            else:
-                st.error(f"### {conclusion}")
-
-            if history_df is not None:
-                st.markdown("#### 📅 近 5 個交易日評分走勢")
-                chart_col, table_col = st.columns([2, 1])
-                with chart_col:
-                    chart_data = history_df.set_index("日期")[["評分"]]
-                    st.line_chart(chart_data, height=220)
-                with table_col:
-                    st.dataframe(history_df, use_container_width=True, hide_index=True)
-
-            with st.expander("🔍 點擊查看今日各項詳細評分指標", expanded=False):
-                for detail in details:
-                    st.write(f"- {detail}")
-        else:
-            st.error(f"分析失敗: {res[1]}")
-
-st.divider()
-
-# ==========================================
-# 第二區塊：指定投資組合批次評估 (依分數高低排序 + 防封鎖)
-# ==========================================
-st.subheader("📋 自選投資組合批次試算 (防 Ban 限流版)")
-st.caption(
-    "點擊「開始試算」後，系統會加入隨機間隔逐檔計算，並依照「綜合評分」由高到低即時動態排序。"
-)
-
-default_tickers = [
-    "2330", "0050", "0056", "2317", "2301", "2308", "3008", "00896",
-    "2395", "2885", "2890", "00878", "3231", "00850", "2454", "2379",
-    "2327", "2880", "2884", "2881", "2882"
-]
-
-st.info(f"📌 **目前待測標的名單 (共 {len(default_tickers)} 檔)：**\n\n" + "、".join(default_tickers))
-
-if st.button("🚀 開始批次試算 (逐檔計算並排序)", type="primary"):
-    all_names = get_twse_stock_names()
-    results = []
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    table_placeholder = st.empty()
-
-    total_stocks = len(default_tickers)
-
-    for idx, code in enumerate(default_tickers):
-        stock_name = all_names.get(code, code)
-        status_text.markdown(f"⏳ **正在分析 ({idx+1}/{total_stocks}):** `{code} {stock_name}`...")
-
-        res = analyze_buy_signal(code, calc_5days_history=False)
-
-        if res[0] is not None:
-            score, conclusion, _, summary_info, _ = res
-            results.append(
-                {
-                    "排名": 0,
-                    "股票代碼": code,
-                    "名稱": stock_name,
-                    "綜合評分": score,
-                    "買點訊號判定": conclusion,
-                    "最新收盤價": summary_info["latest_price"],
-                    "60日季線 (MA60)": summary_info["ma60"],
-                    "PEG": summary_info["peg"],
-                    "PE": summary_info["pe"],
-                }
-            )
-
-            df_current = pd.DataFrame(results).sort_values(
-                by="綜合評分", ascending=False
-            ).reset_index(drop=True)
-            df_current["排名"] = df_current.index + 1
-
-            table_placeholder.dataframe(
-                df_current, use_container_width=True, hide_index=True
-            )
-
-        progress_bar.progress((idx + 1) / total_stocks)
-
-        if idx < total_stocks - 1:
-            time.sleep(random.uniform(1.2, 2.2))
-
-    status_text.success("🎉 全部標的試算完成！已依分數高至低排序如上表。")
+    if curr_ma20 > curr_ma6
