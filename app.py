@@ -48,17 +48,29 @@ def get_twse_stock_names():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_yfinance_ticker_data(symbol: str):
-    """為 yfinance 建立偽裝的 Request Session，避開 YFRateLimitError"""
+    """為 yfinance 建立偽裝的 Request Session，避開 401 錯誤"""
     session = requests.Session()
     session.headers.update(
         {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         }
     )
 
     ticker = yf.Ticker(symbol, session=session)
+    
+    # 歷史股價資料通常不會被 401
     df = ticker.history(period="1y")
-    info = ticker.info
+
+    # info (基本面) 容易被 401 擋住，以獨立 try-except 保護
+    info = {}
+    try:
+        info = ticker.info
+        if not isinstance(info, dict):
+            info = {}
+    except Exception:
+        info = {}
 
     return df, info
 
@@ -73,8 +85,8 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     curr_ma60 = curr["MA60"]
     prev_ma60 = prev["MA60"]
 
-    pe_ratio = info.get("trailingPE", None) or info.get("forwardPE", None)
-    earnings_growth = info.get("earningsGrowth", None)
+    pe_ratio = info.get("trailingPE", None) or info.get("forwardPE", None) if info else None
+    earnings_growth = info.get("earningsGrowth", None) if info else None
 
     score = 0
     details = []
@@ -109,7 +121,6 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
         score += 5
         details.append("ℹ️ 成交量維持正常水準 (+5分)")
 
-    # 與 5 個交易日前相比的漲跌幅
     base_price = df.iloc[idx - 5]["Close"]
     return_5d = (curr_price - base_price) / base_price
     if 0.01 <= return_5d <= 0.08:
@@ -124,7 +135,10 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     # 3. 估值與 PEG (滿分 30)
     peg = None
     if pe_ratio and earnings_growth and earnings_growth > 0:
-        peg = pe_ratio / (earnings_growth * 100)
+        try:
+            peg = pe_ratio / (earnings_growth * 100)
+        except Exception:
+            peg = None
 
     is_etf = stock_code.startswith("00")
     if is_etf:
@@ -140,13 +154,17 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
         else:
             score += 5
             details.append(f"⚠️ PEG 為 {peg:.2f} (> 1.5，價格偏貴，+5分)")
-    else:
-        if pe_ratio and pe_ratio < 25:
+    elif pe_ratio is not None:
+        if pe_ratio < 25:
             score += 20
             details.append(f"ℹ️ 本益比為 {pe_ratio:.1f} (合理區間，+20分)")
         else:
             score += 10
-            details.append("ℹ️ 基本面數據不足或偏高 (+10分)")
+            details.append("ℹ️ 基本面本益比偏高 (+10分)")
+    else:
+        # 當 Yahoo Finance API 擋下 info 時的保底處理
+        score += 15
+        details.append("ℹ️ 估值資料暫時受限，以標準中間基準分評定 (+15分)")
 
     return score, details, round(curr_price, 2), round(curr_ma60, 2), peg, pe_ratio
 
@@ -165,12 +183,10 @@ def analyze_buy_signal(stock_code: str, calc_5days_history: bool = False):
         if df is None or len(df) < 70:
             return None, "❌ 歷史資料不足或代碼有誤 (至少需 70 天資料)", [], {}, None
 
-        # 計算技術指標
         df["MA20"] = df["Close"].rolling(window=20).mean()
         df["MA60"] = df["Close"].rolling(window=60).mean()
         df["Volume_MA20"] = df["Volume"].rolling(window=20).mean()
 
-        # 最新一天的分數與明細
         score, details, latest_price, ma60, peg, pe = compute_score_at_index(
             df, -1, info, stock_code
         )
@@ -189,7 +205,6 @@ def analyze_buy_signal(stock_code: str, calc_5days_history: bool = False):
             "peg": round(peg, 2) if peg else "N/A",
         }
 
-        # 計算近 5 日的分數走勢
         history_df = None
         if calc_5days_history:
             records = []
@@ -233,7 +248,6 @@ if stock_to_analyze:
             score, conclusion, details, summary_info, history_df = res
             st.markdown(f"### 📊 分析股票：{stock_code_clean} {stock_name}")
 
-            # 計算近 5 天分數的增減差額
             delta_score_str = None
             if history_df is not None and len(history_df) >= 5:
                 score_5d_ago = history_df.iloc[0]["評分"]
@@ -253,17 +267,13 @@ if stock_to_analyze:
             else:
                 st.error(f"### {conclusion}")
 
-            # 📈 展現近 5 日歷史分數區塊
             if history_df is not None:
                 st.markdown("#### 📅 近 5 個交易日評分走勢")
-                
                 chart_col, table_col = st.columns([2, 1])
                 with chart_col:
-                    # 分數走勢折線圖
                     chart_data = history_df.set_index("日期")[["評分"]]
                     st.line_chart(chart_data, height=220)
                 with table_col:
-                    # 數據表格
                     st.dataframe(history_df, use_container_width=True, hide_index=True)
 
             with st.expander("🔍 點擊查看今日各項詳細評分指標", expanded=False):
