@@ -15,7 +15,7 @@ st.caption(
     "結合技術面 (站穩季線/多頭排列)、籌碼量能與基本面 (PEG/PE) 自動判定是否為合適買點。"
 )
 
-# 初始化 Session State
+# 初始化 Session State，確保批次試算結果常駐
 if "batch_results" not in st.session_state:
     st.session_state["batch_results"] = None
 
@@ -115,7 +115,7 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     score = 0
     details = []
 
-    # 1. 技術面 (45分)
+    # 1. 技術面 (滿分 45)
     if curr_price > curr_ma60:
         score += 20
         details.append("✅ 股價高於 60 日季線 (站穩季線，+20分)")
@@ -134,7 +134,7 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     else:
         details.append("⚠️ 月線低於季線 (屬盤整震盪期，+0分)")
 
-    # 2. 量能與動能 (25分)
+    # 2. 量能與動能 (滿分 25)
     vol = float(curr["Volume"])
     vol_ma20 = float(curr["Volume_MA20"]) if curr["Volume_MA20"] > 0 else 1.0
 
@@ -159,7 +159,7 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     else:
         details.append("ℹ️ 近 5 日呈拉回或橫盤整理 (+0分)")
 
-    # 3. 估值與 PEG (30分)
+    # 3. 估值與 PEG (滿分 30)
     peg = None
     if pe_ratio and earnings_growth and earnings_growth > 0:
         try:
@@ -198,6 +198,41 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
         details.append("ℹ️ 估值資料暫時受限，以標準中間基準分評定 (+15分)")
 
     return score, details, round(curr_price, 2), round(curr_ma60, 2), peg, pe_ratio
+
+
+def calculate_comprehensive_rank_score(today_score: float, avg_5d: float, latest_price: float, ma60: float, trend_status: str):
+    """
+    全方位加權排序核心演算法：
+    1. 今日分數 (35%)
+    2. 近 5 日平均分數 (35%)
+    3. 季線安全邊際 (15%): 回測季線附近 (1%~5%) 最優
+    4. 動能趨勢加成 (15%): 連續上升給予最高評分
+    """
+    # 季線乖離率評分
+    bias = (latest_price - ma60) / ma60 if ma60 > 0 else 0
+    if 0.01 <= bias <= 0.05:
+        margin_score = 100.0  # 最佳回測買點
+    elif 0.05 < bias <= 0.10:
+        margin_score = 80.0
+    elif 0 <= bias < 0.01:
+        margin_score = 75.0
+    elif bias > 0.10:
+        margin_score = 50.0   # 乖離過大防追高
+    else:
+        margin_score = 20.0   # 跌破季線
+
+    # 趨勢評分
+    if "步步高升" in trend_status:
+        trend_score = 100.0
+    elif "向上增溫" in trend_status:
+        trend_score = 80.0
+    elif "震盪持平" in trend_status:
+        trend_score = 60.0
+    else:
+        trend_score = 40.0
+
+    comp_score = (today_score * 0.35) + (avg_5d * 0.35) + (margin_score * 0.15) + (trend_score * 0.15)
+    return round(comp_score, 1)
 
 
 def analyze_buy_signal(stock_code: str, calc_5days_history: bool = True):
@@ -275,7 +310,7 @@ def analyze_buy_signal(stock_code: str, calc_5days_history: bool = True):
 
 
 # ==========================================
-# 主畫面區塊 (使用 try-except 保護避免空白)
+# 主畫面區塊
 # ==========================================
 try:
     # --- 第一區塊：單檔個股買點訊號診斷器 ---
@@ -336,10 +371,10 @@ try:
 
     st.divider()
 
-    # --- 第二區塊：指定投資組合批次評估 ---
-    st.subheader("📋 自選投資組合批次試算 (防 Ban 限流版)")
+    # --- 第二區塊：指定投資組合批次評估 (綜合各面向排名) ---
+    st.subheader("📋 自選投資組合批次試算 (各面向綜合排名版)")
     st.caption(
-        "點擊「開始試算」後，系統會加入隨機間隔逐檔計算，並依照「今日綜合評分」由高到低即時動態排序。計算完成後會常駐保留於畫面。"
+        "排序依據：**今日即時評分 (35%) + 近5日均分穩定度 (35%) + 季線安全邊際 (15%) + 多日動能趨勢 (15%)**，兼顧成長動能與安全邊際。"
     )
 
     default_tickers = [
@@ -348,11 +383,11 @@ try:
         "2327", "2880", "2884", "2881", "2882"
     ]
 
-    st.info(f"📌 **目前待測標的名單 (共 {len(default_tickers)} 檔)：**\n\n" + "、".join(default_tickers))
+    st.info(f"📌 **待測標的名單 (共 {len(default_tickers)} 檔)：**\n\n" + "、".join(default_tickers))
 
     btn_col1, btn_col2 = st.columns([1, 5])
     with btn_col1:
-        start_batch = st.button("🚀 開始批次試算", type="primary")
+        start_batch = st.button("🚀 開始綜合批次試算", type="primary")
     with btn_col2:
         if st.session_state["batch_results"] is not None:
             if st.button("🗑️ 清除試算結果"):
@@ -372,32 +407,42 @@ try:
 
         for idx, code in enumerate(default_tickers):
             stock_name = all_names.get(code, code)
-            status_placeholder.markdown(f"⏳ **正在分析 ({idx+1}/{total_stocks}):** `{code} {stock_name}`...")
+            status_placeholder.markdown(f"⏳ **正在全方位分析 ({idx+1}/{total_stocks}):** `{code} {stock_name}`...")
 
             res = analyze_buy_signal(code, calc_5days_history=True)
 
             if res[0] is not None:
                 score, conclusion, _, summary_info, _, avg_5d, trend_status = res
+                
+                # 計算全方位綜合排序分
+                composite_rank_score = calculate_comprehensive_rank_score(
+                    today_score=score,
+                    avg_5d=avg_5d,
+                    latest_price=summary_info["latest_price"],
+                    ma60=summary_info["ma60"],
+                    trend_status=trend_status
+                )
+
                 results.append(
                     {
-                        "排名": 0,
+                        "綜合排名": 0,
                         "股票代碼": code,
                         "名稱": stock_name,
-                        "今日綜合評分": score,
-                        "近5日平均分": avg_5d,
-                        "評分趨勢": trend_status,
-                        "買點訊號判定": conclusion,
+                        "全方位綜合分": composite_rank_score,
+                        "今日綜合分": score,
+                        "近5日均分": avg_5d,
+                        "動能趨勢": trend_status,
                         "最新收盤價": summary_info["latest_price"],
-                        "60日季線 (MA60)": summary_info["ma60"],
+                        "60日季線": summary_info["ma60"],
                         "PEG": summary_info["peg"],
                         "PE": summary_info["pe"],
                     }
                 )
 
                 df_current = pd.DataFrame(results).sort_values(
-                    by="今日綜合評分", ascending=False
+                    by="全方位綜合分", ascending=False
                 ).reset_index(drop=True)
-                df_current["排名"] = df_current.index + 1
+                df_current["綜合排名"] = df_current.index + 1
 
                 table_placeholder.dataframe(
                     df_current, use_container_width=True, hide_index=True
@@ -409,19 +454,19 @@ try:
                 time.sleep(random.uniform(1.2, 2.2))
 
         df_final = pd.DataFrame(results).sort_values(
-            by="今日綜合評分", ascending=False
+            by="全方位綜合分", ascending=False
         ).reset_index(drop=True)
-        df_final["排名"] = df_final.index + 1
+        df_final["綜合排名"] = df_final.index + 1
         st.session_state["batch_results"] = df_final
 
         progress_placeholder.empty()
-        status_placeholder.success("🎉 全部標的試算完成！已依分數高至低排序如下表。")
+        status_placeholder.success("🎉 全部標的綜合評估完成！已依「全方位綜合分」由高至低排列如下表。")
         table_placeholder.dataframe(
             st.session_state["batch_results"], use_container_width=True, hide_index=True
         )
 
     elif st.session_state["batch_results"] is not None:
-        status_placeholder.success("📌 以下為先前批次試算的排序結果（已保留於畫面）：")
+        status_placeholder.success("📌 以下為先前批次試算的綜合排序結果（已保留於畫面）：")
         table_placeholder.dataframe(
             st.session_state["batch_results"], use_container_width=True, hide_index=True
         )
