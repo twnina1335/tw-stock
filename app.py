@@ -15,7 +15,7 @@ st.caption(
     "結合技術面 (站穩季線/多頭排列)、籌碼量能與基本面 (PEG/PE) 自動判定是否為合適買點。"
 )
 
-# 初始化 Session State，保留 21 檔批次試算結果
+# 初始化 Session State，確保批次試算結果常駐
 if "batch_results" not in st.session_state:
     st.session_state.batch_results = None
 
@@ -25,14 +25,14 @@ if "batch_results" not in st.session_state:
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_twse_stock_names():
-    """取得上市股票名稱字典與反向名稱索引 (快取 24 小時)"""
+    """取得上市股票名稱字典 (快取 24 小時)"""
     url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     try:
         res = requests.get(url, timeout=10)
         data = res.json()
         name_dict = {item["Code"].strip(): item["Name"].strip() for item in data}
         
-        # 補充常見熱門 ETF 名稱
+        # 補充常見 ETF 名稱
         etf_map = {
             "0050": "元大台灣50",
             "0056": "元大高股息",
@@ -59,9 +59,7 @@ def get_twse_stock_names():
 
 
 def resolve_stock_code(query: str, name_dict: dict):
-    """
-    解析使用者輸入：無論輸入代碼或中文名稱，統一解析出標準股票代碼與名稱
-    """
+    """解析使用者輸入：無論輸入代碼或中文名稱，統一解析出標準股票代碼與名稱"""
     clean_q = query.strip()
     if not clean_q:
         return None, None
@@ -86,7 +84,7 @@ def resolve_stock_code(query: str, name_dict: dict):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_yfinance_ticker_data(symbol: str):
-    """為 yfinance 建立偽裝的 Request Session，避開 401 錯誤"""
+    """為 yfinance 建立偽裝的 Request Session，避開 401/429 限制"""
     session = requests.Session()
     session.headers.update(
         {
@@ -111,7 +109,7 @@ def get_yfinance_ticker_data(symbol: str):
 
 
 def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: str):
-    """計算特定交易日 (以 iloc[idx] 定位) 的技術面、量能與估值分數"""
+    """計算特定交易日的分數"""
     curr = df.iloc[idx]
     prev = df.iloc[idx - 1]
 
@@ -139,7 +137,6 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     else:
         details.append("❌ 60 日季線斜率向下 (+0分)")
 
-    # 💡 修正此處
     if curr_ma20 > curr_ma60:
         score += 10
         details.append("✅ 月線高於季線 (均線多頭排列，+10分)")
@@ -168,4 +165,23 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
     else:
         details.append("ℹ️ 近 5 日呈拉回或橫盤整理 (+0分)")
 
-    #
+    # 3. 估值與 PEG (滿分 30)
+    peg = None
+    if pe_ratio and earnings_growth and earnings_growth > 0:
+        try:
+            peg = pe_ratio / (earnings_growth * 100)
+        except Exception:
+            peg = None
+
+    is_etf = stock_code.startswith("00")
+    if is_etf:
+        score += 20
+        details.append("ℹ️ ETF 標的，給予指數估值基準分 (+20分)")
+    elif peg is not None:
+        if peg <= 1.0:
+            score += 30
+            details.append(f"✅ PEG 為 {peg:.2f} (<= 1.0，安全邊際高，+30分)")
+        elif 1.0 < peg <= 1.5:
+            score += 20
+            details.append(f"✅ PEG 為 {peg:.2f} (1.0~1.5，屬合理區間，+20分)")
+        else:
