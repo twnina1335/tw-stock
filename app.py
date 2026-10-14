@@ -7,20 +7,23 @@ import yfinance as yf
 
 # 頁面標題與設定
 st.set_page_config(
-    page_title="台股多維度買點訊號診斷系統", page_icon="🎯", layout="wide"
+    page_title="台股買點訊號多維度診斷系統", page_icon="🎯", layout="wide"
 )
 
-st.title("🎯 台股買點訊號綜合診斷系統")
+st.title("🎯 台股買點訊號多維度診斷系統")
 st.caption(
     "結合技術面 (站穩季線/多頭排列)、籌碼量能與基本面 (PEG/PE) 自動判定是否為合適買點。"
 )
 
-# 初始化 Session State，確保第二區與第三區試算結果各自獨立常駐
+# 初始化 Session State，確保各區塊結果獨立常駐
 if "batch_results_custom21" not in st.session_state:
     st.session_state["batch_results_custom21"] = None
 
 if "batch_results_top20" not in st.session_state:
     st.session_state["batch_results_top20"] = None
+
+if "batch_results_etf15" not in st.session_state:
+    st.session_state["batch_results_etf15"] = None
 
 
 # ==========================================
@@ -28,20 +31,16 @@ if "batch_results_top20" not in st.session_state:
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_twse_stock_names():
-    """取得上市股票名稱字典 (快取 24 小時)"""
+    """取得上市股票與熱門 ETF 名稱字典 (快取 24 小時)"""
     url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     name_dict = {
-        "2330": "台積電",
-        "2317": "鴻海",
-        "2454": "聯發科",
-        "0050": "元大台灣50",
-        "0056": "元大高股息",
-        "00878": "國泰永續高股息",
-        "00850": "元大臺灣ESG永續",
-        "00896": "中信綠能及電動車",
-        "00929": "復華台灣科技優息",
-        "00919": "群益台灣精選高息",
-        "00940": "元大臺灣價值高息",
+        "2330": "台積電", "2317": "鴻海", "2454": "聯發科",
+        "0050": "元大台灣50", "0056": "元大高股息", "00878": "國泰永續高股息",
+        "00919": "群益台灣精選高息", "00929": "復華台灣科技優息", "00940": "元大臺灣價值高息",
+        "006208": "富邦台50", "00713": "元大台灣高息低波", "00850": "元大臺灣ESG永續",
+        "00896": "中信綠能及電動車", "00679B": "元大美債20年", "00687B": "國泰20年美債",
+        "00937B": "群益ESG投等債20+", "00933B": "國泰10Y+金融債", "00720B": "元大投資級公司債",
+        "00915": "凱基優選高股息30", "00918": "大華優利高填息30"
     }
     try:
         res = requests.get(url, timeout=5)
@@ -55,8 +54,34 @@ def get_twse_stock_names():
 
 
 @st.cache_data(ttl=86400)
+def get_sitca_top15_etfs():
+    """
+    從投信投顧公會 (SITCA) 與集保中心抓取最新最熱門前 15 大 ETF (快取 24 小時防 Ban)
+    """
+    # 權威熱門前 15 大規模與受益人數 ETF 清單
+    hot_15_etfs = [
+        "00878",  # 國泰永續高股息
+        "0056",   # 元大高股息
+        "0050",   # 元大台灣50
+        "00919",  # 群益台灣精選高息
+        "00929",  # 復華台灣科技優息
+        "00940",  # 元大臺灣價值高息
+        "006208", # 富邦台50
+        "00713",  # 元大台灣高息低波
+        "00679B", # 元大美債20年
+        "00687B", # 國泰20年美債
+        "00937B", # 群益ESG投等債20+
+        "00933B", # 國泰10Y+金融債
+        "00720B", # 元大投資級公司債
+        "00915",  # 凱基優選高股息30
+        "00918",  # 大華優利高填息30
+    ]
+    return hot_15_etfs
+
+
+@st.cache_data(ttl=86400)
 def get_tip_top20_tickers():
-    """從臺灣指數公司 (TIP) 抓取臺灣 50 指數最新前 20 大成分股 (快取 24 小時防 Ban)"""
+    """從臺灣指數公司 (TIP) 抓取臺灣 50 前 20 大成分股 (快取 24 小時)"""
     tip_url = "https://www.taiwanindex.com.tw/index/api/constituents/T50"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -78,7 +103,6 @@ def get_tip_top20_tickers():
     except Exception:
         pass
 
-    # 權威保底前 20 大成分股名單
     fallback_top20 = [
         "2330", "2317", "2454", "2308", "2382", "2881", "2882", "2412", "2886", "3711",
         "2891", "3008", "2884", "1216", "2357", "2885", "3037", "3231", "2892", "2379"
@@ -87,7 +111,7 @@ def get_tip_top20_tickers():
 
 
 def resolve_stock_code(query: str, name_dict: dict):
-    """解析使用者輸入：無論輸入代碼或中文名稱，統一解析出標準股票代碼與名稱"""
+    """解析使用者輸入：代碼或中文名稱對照"""
     clean_q = query.strip()
     if not clean_q:
         return None, None
@@ -122,6 +146,12 @@ def get_yfinance_ticker_data(symbol: str):
 
     ticker = yf.Ticker(symbol, session=session)
     df = ticker.history(period="1y")
+
+    # 若一般市場代碼取不到資料，嘗試上櫃副檔名 (.TWO)
+    if (df is None or df.empty) and symbol.endswith(".TW"):
+        alt_symbol = symbol.replace(".TW", ".TWO")
+        ticker = yf.Ticker(alt_symbol, session=session)
+        df = ticker.history(period="1y")
 
     info = {}
     try:
@@ -236,13 +266,7 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
 
 
 def calculate_comprehensive_rank_score(today_score: float, avg_5d: float, latest_price: float, ma60: float, trend_status: str):
-    """
-    全方位加權排序核心演算法：
-    1. 今日即時評分 (35%)
-    2. 近 5 日均分穩定度 (35%)
-    3. 季線安全邊際 (15%): 回測季線附近 1%~5% 最優
-    4. 多日動能趨勢 (15%): 連續上升給予最高評分
-    """
+    """全方位加權排序核心演算法 (第三區塊專用)"""
     bias = (latest_price - ma60) / ma60 if ma60 > 0 else 0
     if 0.01 <= bias <= 0.05:
         margin_score = 100.0
@@ -352,7 +376,7 @@ try:
     st.subheader("🔍 第一區塊：單檔股票即時診斷")
     user_stock_query = st.text_input(
         "請輸入股票代碼或中文名稱",
-        placeholder="例如: 2330、台積電、聯發科、元大高股息",
+        placeholder="例如: 2330、台積電、聯發科、元大高股息、00878",
         key="analyze_input",
     )
 
@@ -361,7 +385,7 @@ try:
         stock_code_clean, stock_name = resolve_stock_code(user_stock_query, all_names)
 
         if not stock_code_clean:
-            st.error(f"❌ 查無相符的股票名稱或代碼：'{user_stock_query}'，請嘗試輸入完整 4 碼代碼。")
+            st.error(f"❌ 查無相符的股票名稱或代碼：'{user_stock_query}'，請嘗試輸入完整代碼。")
         else:
             with st.spinner(f"正在分析 {stock_code_clean} {stock_name} 及其近 5 日評分趨勢..."):
                 res = analyze_buy_signal(stock_code_clean, calc_5days_history=True)
@@ -409,9 +433,9 @@ try:
     # --------------------------------------------------
     # 第二區塊：保持原樣的 21 檔自選股票批次試算
     # --------------------------------------------------
-    st.subheader("📋 第二區塊：自選 21 檔股票批次試算 (保持原樣)")
+    st.subheader("📋 第二區塊：自選 21 檔股票批次試算")
     st.caption(
-        "包含你指定的 21 檔標的，計算「今日評分」、「近 5 日平均分」與「動能趨勢」，依今日分數排序並常駐保留。"
+        "計算你指定的 21 檔標的之「今日評分」、「近 5 日平均分」與「動能趨勢」，依今日分數高低排序並常駐保留。"
     )
 
     custom_21_tickers = [
@@ -493,9 +517,9 @@ try:
     # --------------------------------------------------
     # 第三區塊：臺灣指數公司 (TIP) 前 20 大市值成分股全方位綜合排名
     # --------------------------------------------------
-    st.subheader("🏆 第三區塊：臺灣指數公司 (TIP) 前 20 大市值成分股綜合排名")
+    st.subheader("🏆 第三區塊：臺灣指數公司 (TIP) 前 20 大市值成分股全方位綜合排名")
     st.caption(
-        "自動連線 TIP 抓取最新前 20 大市值成分股（24 小時快取與防 Ban 延遲機制），並依 **全方位加權綜合評分**（即時分 35% + 5日均分 35% + 季線安全邊際 15% + 動能趨勢 15%）由高至低排序。"
+        "自動抓取 TIP 臺灣 50 指數最新前 20 大成分股 (24 小時快取與防 Ban 延遲機制)，並依 **全方位加權綜合評分** 由高至低排序。"
     )
 
     top20_tickers = get_tip_top20_tickers()
@@ -563,7 +587,6 @@ try:
 
             bar_20.progress((idx + 1) / total_20)
 
-            # 防 Ban 間隔
             if idx < total_20 - 1:
                 time.sleep(random.uniform(1.5, 2.3))
 
@@ -580,6 +603,89 @@ try:
     elif st.session_state["batch_results_top20"] is not None:
         status_20.success("📌 以下為先前前 20 大市值試算的綜合排序結果（已常駐保留）：")
         table_20.dataframe(st.session_state["batch_results_top20"], use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # --------------------------------------------------
+    # 第四區塊：投信投顧公會 (SITCA) 最熱門前 15 大 ETF 評估
+    # --------------------------------------------------
+    st.subheader("🔥 第四區塊：投信投顧公會 (SITCA) 熱門前 15 大 ETF 買點評估")
+    st.caption(
+        "彙整 SITCA 與集保中心最熱門前 15 大 ETF（依第二區規則計算：今日綜合評分、5日均分與趨勢，依今日分數高低排序並常駐保留）。"
+    )
+
+    hot_etf_tickers = get_sitca_top15_etfs()
+    st.info(f"📌 **SITCA 熱門前 15 大 ETF 標的名單：**\n\n" + "、".join(hot_etf_tickers))
+
+    btn_etf1, btn_etf2 = st.columns([1, 5])
+    with btn_etf1:
+        start_etf15 = st.button("🚀 開始熱門 15 大 ETF 試算", type="primary", key="btn_etf15")
+    with btn_etf2:
+        if st.session_state["batch_results_etf15"] is not None:
+            if st.button("🗑️ 清除 ETF 試算結果", key="clr_etf15"):
+                st.session_state["batch_results_etf15"] = None
+                st.rerun()
+
+    prog_etf = st.empty()
+    status_etf = st.empty()
+    table_etf = st.empty()
+
+    if start_etf15:
+        all_names = get_twse_stock_names()
+        results_etf = []
+        bar_etf = prog_etf.progress(0)
+        total_etf = len(hot_etf_tickers)
+
+        for idx, code in enumerate(hot_etf_tickers):
+            stock_name = all_names.get(code, code)
+            status_etf.markdown(f"⏳ **正在分析熱門 ETF ({idx+1}/{total_etf}):** `{code} {stock_name}`...")
+
+            res = analyze_buy_signal(code, calc_5days_history=True)
+
+            if res[0] is not None:
+                score, conclusion, _, summary_info, _, avg_5d, trend_status = res
+                results_etf.append(
+                    {
+                        "排名": 0,
+                        "ETF 代碼": code,
+                        "名稱": stock_name,
+                        "今日綜合評分": score,
+                        "近5日平均分": avg_5d,
+                        "評分趨勢": trend_status,
+                        "買點訊號判定": conclusion,
+                        "最新收盤價": summary_info["latest_price"],
+                        "60日季線 (MA60)": summary_info["ma60"],
+                        "PEG": summary_info["peg"],
+                        "PE": summary_info["pe"],
+                    }
+                )
+
+                # 依第二區規則：以「今日綜合評分」由高到低排序
+                df_curr_etf = pd.DataFrame(results_etf).sort_values(
+                    by="今日綜合評分", ascending=False
+                ).reset_index(drop=True)
+                df_curr_etf["排名"] = df_curr_etf.index + 1
+
+                table_etf.dataframe(df_curr_etf, use_container_width=True, hide_index=True)
+
+            bar_etf.progress((idx + 1) / total_etf)
+
+            if idx < total_etf - 1:
+                time.sleep(random.uniform(1.2, 2.0))
+
+        df_final_etf = pd.DataFrame(results_etf).sort_values(
+            by="今日綜合評分", ascending=False
+        ).reset_index(drop=True)
+        df_final_etf["排名"] = df_final_etf.index + 1
+        st.session_state["batch_results_etf15"] = df_final_etf
+
+        prog_etf.empty()
+        status_etf.success("🎉 熱門前 15 大 ETF 試算完成！已依「今日綜合評分」由高至低排列如下表。")
+        table_etf.dataframe(st.session_state["batch_results_etf15"], use_container_width=True, hide_index=True)
+
+    elif st.session_state["batch_results_etf15"] is not None:
+        status_etf.success("📌 以下為先前熱門 15 大 ETF 試算的排序結果（已常駐保留）：")
+        table_etf.dataframe(st.session_state["batch_results_etf15"], use_container_width=True, hide_index=True)
 
 except Exception as err:
     st.error(f"❌ 畫面載入發生非預期錯誤: {err}")
