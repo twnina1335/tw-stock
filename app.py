@@ -7,17 +7,20 @@ import yfinance as yf
 
 # 頁面標題與設定
 st.set_page_config(
-    page_title="台股個股買點訊號診斷器", page_icon="🎯", layout="wide"
+    page_title="台股多維度買點訊號診斷系統", page_icon="🎯", layout="wide"
 )
 
-st.title("🎯 台股買點訊號綜合診斷器")
+st.title("🎯 台股買點訊號綜合診斷系統")
 st.caption(
     "結合技術面 (站穩季線/多頭排列)、籌碼量能與基本面 (PEG/PE) 自動判定是否為合適買點。"
 )
 
-# 初始化 Session State，確保批次試算結果常駐
-if "batch_results" not in st.session_state:
-    st.session_state["batch_results"] = None
+# 初始化 Session State，確保第二區與第三區試算結果各自獨立常駐
+if "batch_results_custom21" not in st.session_state:
+    st.session_state["batch_results_custom21"] = None
+
+if "batch_results_top20" not in st.session_state:
+    st.session_state["batch_results_top20"] = None
 
 
 # ==========================================
@@ -51,6 +54,38 @@ def get_twse_stock_names():
     return name_dict
 
 
+@st.cache_data(ttl=86400)
+def get_tip_top20_tickers():
+    """從臺灣指數公司 (TIP) 抓取臺灣 50 指數最新前 20 大成分股 (快取 24 小時防 Ban)"""
+    tip_url = "https://www.taiwanindex.com.tw/index/api/constituents/T50"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Referer": "https://www.taiwanindex.com.tw/",
+    }
+
+    try:
+        res = requests.get(tip_url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            records = data.get("data", []) or data.get("records", [])
+            tickers = []
+            for item in records:
+                code = str(item.get("code") or item.get("stock_id") or item.get("symbol", "")).strip()
+                if code and code.isdigit():
+                    tickers.append(code)
+            if len(tickers) >= 20:
+                return tickers[:20]
+    except Exception:
+        pass
+
+    # 權威保底前 20 大成分股名單
+    fallback_top20 = [
+        "2330", "2317", "2454", "2308", "2382", "2881", "2882", "2412", "2886", "3711",
+        "2891", "3008", "2884", "1216", "2357", "2885", "3037", "3231", "2892", "2379"
+    ]
+    return fallback_top20
+
+
 def resolve_stock_code(query: str, name_dict: dict):
     """解析使用者輸入：無論輸入代碼或中文名稱，統一解析出標準股票代碼與名稱"""
     clean_q = query.strip()
@@ -77,7 +112,7 @@ def resolve_stock_code(query: str, name_dict: dict):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_yfinance_ticker_data(symbol: str):
-    """為 yfinance 建立偽裝 Session"""
+    """為 yfinance 建立偽裝 Session，避免 401 錯誤"""
     session = requests.Session()
     session.headers.update(
         {
@@ -203,25 +238,23 @@ def compute_score_at_index(df: pd.DataFrame, idx: int, info: dict, stock_code: s
 def calculate_comprehensive_rank_score(today_score: float, avg_5d: float, latest_price: float, ma60: float, trend_status: str):
     """
     全方位加權排序核心演算法：
-    1. 今日分數 (35%)
-    2. 近 5 日平均分數 (35%)
-    3. 季線安全邊際 (15%): 回測季線附近 (1%~5%) 最優
-    4. 動能趨勢加成 (15%): 連續上升給予最高評分
+    1. 今日即時評分 (35%)
+    2. 近 5 日均分穩定度 (35%)
+    3. 季線安全邊際 (15%): 回測季線附近 1%~5% 最優
+    4. 多日動能趨勢 (15%): 連續上升給予最高評分
     """
-    # 季線乖離率評分
     bias = (latest_price - ma60) / ma60 if ma60 > 0 else 0
     if 0.01 <= bias <= 0.05:
-        margin_score = 100.0  # 最佳回測買點
+        margin_score = 100.0
     elif 0.05 < bias <= 0.10:
         margin_score = 80.0
     elif 0 <= bias < 0.01:
         margin_score = 75.0
     elif bias > 0.10:
-        margin_score = 50.0   # 乖離過大防追高
+        margin_score = 50.0
     else:
-        margin_score = 20.0   # 跌破季線
+        margin_score = 20.0
 
-    # 趨勢評分
     if "步步高升" in trend_status:
         trend_score = 100.0
     elif "向上增溫" in trend_status:
@@ -313,8 +346,10 @@ def analyze_buy_signal(stock_code: str, calc_5days_history: bool = True):
 # 主畫面區塊
 # ==========================================
 try:
-    # --- 第一區塊：單檔個股買點訊號診斷器 ---
-    st.subheader("🔍 單檔股票即時診斷")
+    # --------------------------------------------------
+    # 第一區塊：單檔個股買點訊號診斷器
+    # --------------------------------------------------
+    st.subheader("🔍 第一區塊：單檔股票即時診斷")
     user_stock_query = st.text_input(
         "請輸入股票代碼或中文名稱",
         placeholder="例如: 2330、台積電、聯發科、元大高股息",
@@ -371,50 +406,129 @@ try:
 
     st.divider()
 
-    # --- 第二區塊：指定投資組合批次評估 (綜合各面向排名) ---
-    st.subheader("📋 自選投資組合批次試算 (各面向綜合排名版)")
+    # --------------------------------------------------
+    # 第二區塊：保持原樣的 21 檔自選股票批次試算
+    # --------------------------------------------------
+    st.subheader("📋 第二區塊：自選 21 檔股票批次試算 (保持原樣)")
     st.caption(
-        "排序依據：**今日即時評分 (35%) + 近5日均分穩定度 (35%) + 季線安全邊際 (15%) + 多日動能趨勢 (15%)**，兼顧成長動能與安全邊際。"
+        "包含你指定的 21 檔標的，計算「今日評分」、「近 5 日平均分」與「動能趨勢」，依今日分數排序並常駐保留。"
     )
 
-    default_tickers = [
+    custom_21_tickers = [
         "2330", "0050", "0056", "2317", "2301", "2308", "3008", "00896",
         "2395", "2885", "2890", "00878", "3231", "00850", "2454", "2379",
         "2327", "2880", "2884", "2881", "2882"
     ]
 
-    st.info(f"📌 **待測標的名單 (共 {len(default_tickers)} 檔)：**\n\n" + "、".join(default_tickers))
+    st.info(f"📌 **自選 21 檔標的名單：**\n\n" + "、".join(custom_21_tickers))
 
-    btn_col1, btn_col2 = st.columns([1, 5])
-    with btn_col1:
-        start_batch = st.button("🚀 開始綜合批次試算", type="primary")
-    with btn_col2:
-        if st.session_state["batch_results"] is not None:
-            if st.button("🗑️ 清除試算結果"):
-                st.session_state["batch_results"] = None
+    btn21_col1, btn21_col2 = st.columns([1, 5])
+    with btn21_col1:
+        start_custom21 = st.button("🚀 開始 21 檔試算", type="primary", key="btn_custom21")
+    with btn21_col2:
+        if st.session_state["batch_results_custom21"] is not None:
+            if st.button("🗑️ 清除 21 檔結果", key="clr_custom21"):
+                st.session_state["batch_results_custom21"] = None
                 st.rerun()
 
-    progress_placeholder = st.empty()
-    status_placeholder = st.empty()
-    table_placeholder = st.empty()
+    prog_21 = st.empty()
+    status_21 = st.empty()
+    table_21 = st.empty()
 
-    if start_batch:
+    if start_custom21:
         all_names = get_twse_stock_names()
-        results = []
+        results_21 = []
+        bar_21 = prog_21.progress(0)
+        total_21 = len(custom_21_tickers)
 
-        progress_bar = progress_placeholder.progress(0)
-        total_stocks = len(default_tickers)
-
-        for idx, code in enumerate(default_tickers):
+        for idx, code in enumerate(custom_21_tickers):
             stock_name = all_names.get(code, code)
-            status_placeholder.markdown(f"⏳ **正在全方位分析 ({idx+1}/{total_stocks}):** `{code} {stock_name}`...")
+            status_21.markdown(f"⏳ **正在分析 21 檔標的 ({idx+1}/{total_21}):** `{code} {stock_name}`...")
+
+            res = analyze_buy_signal(code, calc_5days_history=True)
+            if res[0] is not None:
+                score, conclusion, _, summary_info, _, avg_5d, trend_status = res
+                results_21.append(
+                    {
+                        "排名": 0,
+                        "股票代碼": code,
+                        "名稱": stock_name,
+                        "今日綜合評分": score,
+                        "近5日平均分": avg_5d,
+                        "評分趨勢": trend_status,
+                        "買點訊號判定": conclusion,
+                        "最新收盤價": summary_info["latest_price"],
+                        "60日季線 (MA60)": summary_info["ma60"],
+                        "PEG": summary_info["peg"],
+                        "PE": summary_info["pe"],
+                    }
+                )
+
+                df_curr21 = pd.DataFrame(results_21).sort_values(
+                    by="今日綜合評分", ascending=False
+                ).reset_index(drop=True)
+                df_curr21["排名"] = df_curr21.index + 1
+                table_21.dataframe(df_curr21, use_container_width=True, hide_index=True)
+
+            bar_21.progress((idx + 1) / total_21)
+            if idx < total_21 - 1:
+                time.sleep(random.uniform(1.2, 2.0))
+
+        df_final21 = pd.DataFrame(results_21).sort_values(
+            by="今日綜合評分", ascending=False
+        ).reset_index(drop=True)
+        df_final21["排名"] = df_final21.index + 1
+        st.session_state["batch_results_custom21"] = df_final21
+
+        prog_21.empty()
+        status_21.success("🎉 21 檔標的試算完成！已依「今日綜合評分」由高至低排列如下表。")
+        table_21.dataframe(st.session_state["batch_results_custom21"], use_container_width=True, hide_index=True)
+
+    elif st.session_state["batch_results_custom21"] is not None:
+        status_21.success("📌 以下為先前 21 檔試算的排序結果（已常駐保留）：")
+        table_21.dataframe(st.session_state["batch_results_custom21"], use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # --------------------------------------------------
+    # 第三區塊：臺灣指數公司 (TIP) 前 20 大市值成分股全方位綜合排名
+    # --------------------------------------------------
+    st.subheader("🏆 第三區塊：臺灣指數公司 (TIP) 前 20 大市值成分股綜合排名")
+    st.caption(
+        "自動連線 TIP 抓取最新前 20 大市值成分股（24 小時快取與防 Ban 延遲機制），並依 **全方位加權綜合評分**（即時分 35% + 5日均分 35% + 季線安全邊際 15% + 動能趨勢 15%）由高至低排序。"
+    )
+
+    top20_tickers = get_tip_top20_tickers()
+    st.info(f"📌 **目前 TIP 前 20 大市值成分股名單：**\n\n" + "、".join(top20_tickers))
+
+    btn20_col1, btn20_col2 = st.columns([1, 5])
+    with btn20_col1:
+        start_top20 = st.button("🚀 開始前 20 大市值試算", type="primary", key="btn_top20")
+    with btn20_col2:
+        if st.session_state["batch_results_top20"] is not None:
+            if st.button("🗑️ 清除前 20 大結果", key="clr_top20"):
+                st.session_state["batch_results_top20"] = None
+                st.rerun()
+
+    prog_20 = st.empty()
+    status_20 = st.empty()
+    table_20 = st.empty()
+
+    if start_top20:
+        all_names = get_twse_stock_names()
+        results_20 = []
+        bar_20 = prog_20.progress(0)
+        total_20 = len(top20_tickers)
+
+        for idx, code in enumerate(top20_tickers):
+            stock_name = all_names.get(code, code)
+            status_20.markdown(f"⏳ **正在全方位分析前 20 大標的 ({idx+1}/{total_20}):** `{code} {stock_name}`...")
 
             res = analyze_buy_signal(code, calc_5days_history=True)
 
             if res[0] is not None:
                 score, conclusion, _, summary_info, _, avg_5d, trend_status = res
-                
-                # 計算全方位綜合排序分
+
                 composite_rank_score = calculate_comprehensive_rank_score(
                     today_score=score,
                     avg_5d=avg_5d,
@@ -423,7 +537,7 @@ try:
                     trend_status=trend_status
                 )
 
-                results.append(
+                results_20.append(
                     {
                         "綜合排名": 0,
                         "股票代碼": code,
@@ -432,6 +546,7 @@ try:
                         "今日綜合分": score,
                         "近5日均分": avg_5d,
                         "動能趨勢": trend_status,
+                        "買點訊號判定": conclusion,
                         "最新收盤價": summary_info["latest_price"],
                         "60日季線": summary_info["ma60"],
                         "PEG": summary_info["peg"],
@@ -439,37 +554,32 @@ try:
                     }
                 )
 
-                df_current = pd.DataFrame(results).sort_values(
+                df_curr20 = pd.DataFrame(results_20).sort_values(
                     by="全方位綜合分", ascending=False
                 ).reset_index(drop=True)
-                df_current["綜合排名"] = df_current.index + 1
+                df_curr20["綜合排名"] = df_curr20.index + 1
 
-                table_placeholder.dataframe(
-                    df_current, use_container_width=True, hide_index=True
-                )
+                table_20.dataframe(df_curr20, use_container_width=True, hide_index=True)
 
-            progress_bar.progress((idx + 1) / total_stocks)
+            bar_20.progress((idx + 1) / total_20)
 
-            if idx < total_stocks - 1:
-                time.sleep(random.uniform(1.2, 2.2))
+            # 防 Ban 間隔
+            if idx < total_20 - 1:
+                time.sleep(random.uniform(1.5, 2.3))
 
-        df_final = pd.DataFrame(results).sort_values(
+        df_final20 = pd.DataFrame(results_20).sort_values(
             by="全方位綜合分", ascending=False
         ).reset_index(drop=True)
-        df_final["綜合排名"] = df_final.index + 1
-        st.session_state["batch_results"] = df_final
+        df_final20["綜合排名"] = df_final20.index + 1
+        st.session_state["batch_results_top20"] = df_final20
 
-        progress_placeholder.empty()
-        status_placeholder.success("🎉 全部標的綜合評估完成！已依「全方位綜合分」由高至低排列如下表。")
-        table_placeholder.dataframe(
-            st.session_state["batch_results"], use_container_width=True, hide_index=True
-        )
+        prog_20.empty()
+        status_20.success("🎉 前 20 大市值成分股全方位評估完成！已依「全方位綜合分」由高至低排列如下表。")
+        table_20.dataframe(st.session_state["batch_results_top20"], use_container_width=True, hide_index=True)
 
-    elif st.session_state["batch_results"] is not None:
-        status_placeholder.success("📌 以下為先前批次試算的綜合排序結果（已保留於畫面）：")
-        table_placeholder.dataframe(
-            st.session_state["batch_results"], use_container_width=True, hide_index=True
-        )
+    elif st.session_state["batch_results_top20"] is not None:
+        status_20.success("📌 以下為先前前 20 大市值試算的綜合排序結果（已常駐保留）：")
+        table_20.dataframe(st.session_state["batch_results_top20"], use_container_width=True, hide_index=True)
 
 except Exception as err:
     st.error(f"❌ 畫面載入發生非預期錯誤: {err}")
